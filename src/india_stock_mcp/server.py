@@ -27,6 +27,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from india_stock_mcp.config import settings
+from india_stock_mcp.ratelimit import RateLimitMiddleware
 
 logging.basicConfig(
     level=settings.log_level,
@@ -501,16 +502,19 @@ async def health(request: Request) -> JSONResponse:
 
 
 def main() -> None:
-    app = mcp.streamable_http_app(stateless_http=True, json_response=True, host=settings.host)
-    logger.info("Starting india-stock-mcp on http://%s:%s/mcp", settings.host, settings.port)
-    uvicorn.run(
-        app,
-        host=settings.host,
-        port=settings.port,
-        log_level=settings.log_level.lower(),
-        proxy_headers=True,
-        forwarded_allow_ips="*",
+    mcp_app = mcp.streamable_http_app(stateless_http=True, json_response=True, host=settings.host)
+    app = RateLimitMiddleware(
+        mcp_app,
+        limit_per_minute=settings.rate_limit_per_minute,
+        trusted_proxy_hops=settings.trusted_proxy_hops,
     )
+    logger.info(
+        "Starting india-stock-mcp on http://%s:%s/mcp (rate limit %d/min per client)",
+        settings.host,
+        settings.port,
+        settings.rate_limit_per_minute,
+    )
+    uvicorn.run(app, host=settings.host, port=settings.port, log_level=settings.log_level.lower())
 
 
 if __name__ == "__main__":

@@ -21,8 +21,10 @@ class Settings(BaseSettings):
     history_cache_ttl: int = Field(default=15 * 60, ge=0)
     info_cache_ttl: int = Field(default=6 * 60 * 60, ge=0)
 
-    # --- Abuse protection (used in the next step) ---
+    # --- Abuse protection ---
     rate_limit_per_minute: int = Field(default=60, ge=1)
+    # How many load balancers sit in front of the app: 0 = direct (local dev), 1 = Render/Railway/etc.
+    trusted_proxy_hops: int = Field(default=0, ge=0)
 
     @field_validator("log_level", mode="before")
     @classmethod
