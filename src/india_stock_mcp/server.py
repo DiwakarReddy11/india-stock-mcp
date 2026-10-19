@@ -9,10 +9,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-import os
 import re
 from collections.abc import Callable
 from datetime import datetime, time
+from time import sleep
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
@@ -26,8 +26,10 @@ from mcp_types import ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from india_stock_mcp.config import settings
+
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
+    level=settings.log_level,
     format="%(asctime)s %(levelname)s %(name)s - %(message)s",
 )
 logger = logging.getLogger("india_stock_mcp")
@@ -66,15 +68,19 @@ SYMBOL_PATTERN = re.compile(r"^[A-Z0-9&\-]{1,20}$")
 MAX_COMPARE = 5
 ONE_CRORE = 10_000_000
 
+# Yahoo intermittently returns empty data or errors under load, so upstream calls are retried.
+UPSTREAM_ATTEMPTS = 3
+UPSTREAM_BACKOFF_SECONDS = 0.5
+
 READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=True)
 
 # --------------------------------------------------------------------------- #
 # Caching - many users asking for the same stock should cost one upstream call.
 # --------------------------------------------------------------------------- #
 
-_quote_cache: TTLCache = TTLCache(maxsize=2_000, ttl=60)  # prices: 1 minute
-_history_cache: TTLCache = TTLCache(maxsize=1_000, ttl=15 * 60)  # candles: 15 minutes
-_info_cache: TTLCache = TTLCache(maxsize=1_000, ttl=6 * 60 * 60)  # fundamentals: 6 hours
+_quote_cache: TTLCache = TTLCache(maxsize=2_000, ttl=settings.quote_cache_ttl)
+_history_cache: TTLCache = TTLCache(maxsize=1_000, ttl=settings.history_cache_ttl)
+_info_cache: TTLCache = TTLCache(maxsize=1_000, ttl=settings.info_cache_ttl)
 
 
 async def _cached(cache: TTLCache, key: tuple, fetch: Callable[[], Any]) -> Any:
@@ -127,9 +133,32 @@ def to_crore(value: Any) -> float | None:
     return None if number is None else round(number / ONE_CRORE, 2)
 
 
+def call_upstream(ticker: str, fetch: Callable[[], Any], is_empty: Callable[[Any], bool]) -> Any:
+    """Call Yahoo with retries. Returns None if every attempt came back empty."""
+    failure: Exception | None = None
+    for attempt in range(1, UPSTREAM_ATTEMPTS + 1):
+        try:
+            result = fetch()
+            if not is_empty(result):
+                return result
+            failure = None
+        except Exception as exc:  # yfinance raises many types: network, rate limit, parsing
+            failure = exc
+            logger.warning("Upstream call for %s failed (attempt %d): %r", ticker, attempt, exc)
+        if attempt < UPSTREAM_ATTEMPTS:
+            sleep(UPSTREAM_BACKOFF_SECONDS * attempt)
+    if failure is not None:
+        raise ToolError(f"Market data provider is temporarily unavailable for {ticker}. Try again shortly.")
+    return None
+
+
 def fetch_history(ticker: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
-    df = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=False)
-    if df is None or df.empty:
+    df = call_upstream(
+        ticker,
+        lambda: yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=False),
+        lambda df: df is None or df.empty,
+    )
+    if df is None:
         raise ToolError(f"No price data found for {ticker}. Check the symbol and exchange.")
     return df.dropna(subset=["Close"])
 
@@ -168,8 +197,12 @@ async def get_quote(ticker: str) -> dict[str, Any]:
 
 
 def fetch_info(ticker: str) -> dict[str, Any]:
-    info = yf.Ticker(ticker).info or {}
-    if not info.get("longName") and not info.get("shortName"):
+    info = call_upstream(
+        ticker,
+        lambda: yf.Ticker(ticker).info or {},
+        lambda info: not info.get("longName") and not info.get("shortName"),
+    )
+    if info is None:
         raise ToolError(f"No company information found for {ticker}. Check the symbol and exchange.")
     return info
 
@@ -211,7 +244,8 @@ mcp = MCPServer(
     instructions=(
         "Tools for analysing Indian stocks listed on NSE and BSE. "
         "Use NSE trading symbols such as RELIANCE, TCS, INFY, HDFCBANK (exchange defaults to NSE). "
-        "Prices are in INR and may be delayed ~15 minutes. Market cap values are in crore (1 crore = 10 million). "
+        "Prices are in INR and may be delayed ~15 minutes. "
+        "Market cap values are in crore (1 crore = 10 million). "
         "Always tell the user that this is not investment advice."
     ),
 )
@@ -332,7 +366,12 @@ async def get_technical_analysis(symbol: str, exchange: Exchange = "NSE") -> dic
         "symbol": ticker,
         "as_of": df.index[-1].date().isoformat(),
         "price": num(price),
-        "moving_averages": {"sma_20": num(sma20), "sma_50": num(sma50), "sma_200": num(sma200), "ema_20": num(ema20)},
+        "moving_averages": {
+            "sma_20": num(sma20),
+            "sma_50": num(sma50),
+            "sma_200": num(sma200),
+            "ema_20": num(ema20),
+        },
         "rsi_14": num(rsi14),
         "macd": {"macd": num(macd_line), "signal": num(macd_signal), "histogram": num(macd_hist)},
         "bollinger_bands": {"upper": num(bb_upper), "middle": num(bb_middle), "lower": num(bb_lower)},
@@ -378,7 +417,7 @@ async def get_fundamentals(symbol: str, exchange: Exchange = "NSE") -> dict[str,
 
 @mcp.tool(annotations=READ_ONLY)
 async def compare_stocks(symbols: list[str], exchange: Exchange = "NSE") -> dict[str, Any]:
-    """Compare up to 5 Indian stocks side by side: price, today's change, and 1-month / 6-month / 1-year returns.
+    """Compare up to 5 Indian stocks side by side: price, today's change and 1-month/6-month/1-year returns.
 
     Args:
         symbols: 2 to 5 trading symbols, e.g. ["TCS", "INFY", "WIPRO"].
@@ -462,11 +501,16 @@ async def health(request: Request) -> JSONResponse:
 
 
 def main() -> None:
-    host = os.getenv("HOST", "127.0.0.1")
-    port = int(os.getenv("PORT", "8000"))
-    app = mcp.streamable_http_app(stateless_http=True, json_response=True, host=host)
-    logger.info("Starting india-stock-mcp on http://%s:%s/mcp", host, port)
-    uvicorn.run(app, host=host, port=port, proxy_headers=True, forwarded_allow_ips="*")
+    app = mcp.streamable_http_app(stateless_http=True, json_response=True, host=settings.host)
+    logger.info("Starting india-stock-mcp on http://%s:%s/mcp", settings.host, settings.port)
+    uvicorn.run(
+        app,
+        host=settings.host,
+        port=settings.port,
+        log_level=settings.log_level.lower(),
+        proxy_headers=True,
+        forwarded_allow_ips="*",
+    )
 
 
 if __name__ == "__main__":
