@@ -99,7 +99,7 @@ AI client ──HTTPS POST /mcp──▶ Rate limiter ──▶ MCP server (stat
 Requires [uv](https://docs.astral.sh/uv/) and Python 3.11+.
 
 ```bash
-git clone https://github.com/YOUR_GITHUB_USERNAME/india-stock-mcp.git
+git clone https://github.com/DiwakarReddy11/india-stock-mcp.git
 cd india-stock-mcp
 uv sync
 uv run python -m india_stock_mcp.server
