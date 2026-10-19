@@ -12,7 +12,7 @@ ENV UV_COMPILE_BYTECODE=1 \
 WORKDIR /app
 
 # Dependencies first: this layer is cached until pyproject.toml or uv.lock change.
-COPY pyproject.toml uv.lock README.md ./
+COPY pyproject.toml uv.lock README.md LICENSE ./
 RUN uv sync --locked --no-dev --no-install-project
 
 # Then our own code, installed as a regular (non-editable) package.

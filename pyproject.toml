@@ -3,6 +3,9 @@ name = "india-stock-mcp"
 version = "0.1.0"
 description = "Production-ready MCP server for Indian stock market (NSE/BSE) analysis over Streamable HTTP."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+
 authors = [
     { name = "DiwakarReddy", email = "divakarreddyvengalreddy1107@gmail.com" }
 ]
